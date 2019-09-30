@@ -5,11 +5,13 @@ import (
 	"database/sql"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/src-d/metadata-retrieval/database"
 	"github.com/src-d/metadata-retrieval/github"
+	"github.com/src-d/metadata-retrieval/github/store"
 	"golang.org/x/oauth2"
 	"gopkg.in/src-d/go-cli.v0"
 	"gopkg.in/src-d/go-log.v1"
@@ -22,6 +24,7 @@ var (
 )
 
 var app = cli.New("metadata", version, build, "GitHub metadata downloader")
+var db *sql.DB
 
 func main() {
 	app.AddCommand(&Repository{})
@@ -50,7 +53,7 @@ type Repository struct {
 func (c *Repository) Execute(args []string) error {
 	return c.ExecuteBody(
 		log.New(log.Fields{"owner": c.Owner, "repo": c.Name}),
-		func(httpClient *http.Client, downloader *github.Downloader) error {
+		func(logger log.Logger, httpClient *http.Client, downloader downloader) error {
 			return downloader.DownloadRepository(context.TODO(), c.Owner, c.Name, c.Version)
 		})
 }
@@ -65,7 +68,7 @@ type Organization struct {
 func (c *Organization) Execute(args []string) error {
 	return c.ExecuteBody(
 		log.New(log.Fields{"org": c.Name}),
-		func(httpClient *http.Client, downloader *github.Downloader) error {
+		func(logger log.Logger, httpClient *http.Client, downloader downloader) error {
 			return downloader.DownloadOrganization(context.TODO(), c.Name, c.Version)
 		})
 }
@@ -74,37 +77,88 @@ type Ghsync struct {
 	cli.Command `name:"ghsync" short-description:"Mimics ghsync deep command" long-description:"Mimics ghsync deep command"`
 	DownloaderCmd
 
-	Name    string `long:"name" description:"GitHub organization name" required:"true"`
-	NoForks bool   `long:"no-forks"  env:"GHSYNC_NO_FORKS" description:"github forked repositories will be skipped"`
+	Name               string `long:"name" description:"GitHub organization name" required:"true"`
+	NoForks            bool   `long:"no-forks" env:"GHSYNC_NO_FORKS" description:"github forked repositories will be skipped"`
+	MaxParallelization int    `long:"max-parallelization" default:"10" env:"GHSYNC_MAX_PARALLELIZATION" description:"maximum number of repositories to download concurrently"`
 }
 
 func (c *Ghsync) Execute(args []string) error {
 	return c.ExecuteBody(
 		log.New(log.Fields{"org": c.Name}),
-		func(httpClient *http.Client, downloader *github.Downloader) error {
+		func(logger log.Logger, httpClient *http.Client, downloader downloader) error {
 			repos, err := listRepositories(context.TODO(), httpClient, c.Name, c.NoForks)
 			if err != nil {
 				return err
 			}
 
+			logger.Infof("downloading organization %s", c.Name)
 			err = downloader.DownloadOrganization(context.TODO(), c.Name, c.Version)
 			if err != nil {
 				return fmt.Errorf("failed to download organization %v: %v", c.Name, err)
 			}
 
+			logger.Infof("finished downloading organization %s", c.Name)
+
+			var wg sync.WaitGroup
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			sem := make(chan struct{}, c.MaxParallelization)
+			errCh := make(chan error, c.MaxParallelization)
+
 			for _, repo := range repos {
-				err = downloader.DownloadRepository(context.TODO(), c.Name, repo, c.Version)
-				if err != nil {
-					return fmt.Errorf("failed to download repository %v/%v: %v", c.Name, repo, err)
+				sem <- struct{}{}
+				if ctx.Err() != nil {
+					break
 				}
+
+				wg.Add(1)
+
+				go func(logger log.Logger, repo string) {
+					defer func() {
+						<-sem
+						wg.Done()
+					}()
+
+					logger.Infof("downloading repository")
+					err := c.downloadRepository(ctx, downloader, repo)
+					if err != nil {
+						logger.Errorf(err, "error downloading repository")
+						errCh <- err
+						if ctx.Err() == nil {
+							logger.Errorf(err, "canceling context to stop running jobs")
+							cancel()
+						}
+
+						return
+					}
+
+					logger.Infof("finished downloading repository")
+				}(logger.With(log.Fields{"repo": repo}), repo)
 			}
 
-			return nil
+			wg.Wait()
 
+			select {
+			case err := <-errCh:
+				return err
+			default:
+				return nil
+			}
 		})
 }
 
-type bodyFunc = func(httpClient *http.Client, downloader *github.Downloader) error
+func (c *Ghsync) downloadRepository(ctx context.Context, downloader downloader, repo string) error {
+	err := downloader.DownloadRepository(ctx, c.Name, repo, c.Version)
+	if err != nil {
+		return fmt.Errorf("failed to download repository %v/%v: %v", c.Name, repo, err)
+	}
+
+	return nil
+}
+
+type bodyFunc = func(logger log.Logger, httpClient *http.Client, downloader downloader) error
 
 func (c *DownloaderCmd) ExecuteBody(logger log.Logger, fn bodyFunc) error {
 	client := oauth2.NewClient(context.TODO(), oauth2.StaticTokenSource(
@@ -121,7 +175,7 @@ func (c *DownloaderCmd) ExecuteBody(logger log.Logger, fn bodyFunc) error {
 	}
 
 	defer func() {
-		downloader.Close()
+		db.Close()
 	}()
 
 	rate0, err := downloader.RateRemaining(context.TODO())
@@ -130,7 +184,7 @@ func (c *DownloaderCmd) ExecuteBody(logger log.Logger, fn bodyFunc) error {
 	}
 	t0 := time.Now()
 
-	err = fn(client, downloader)
+	err = fn(logger, client, downloader)
 	if err != nil {
 		return err
 	}
@@ -157,13 +211,97 @@ func (c *DownloaderCmd) ExecuteBody(logger log.Logger, fn bodyFunc) error {
 	return nil
 }
 
-func (c *DownloaderCmd) buildDownloader(client *http.Client) (*github.Downloader, error) {
+type downloader interface {
+	DownloadRepository(ctx context.Context, owner string, name string, version int) error
+	DownloadOrganization(ctx context.Context, name string, version int) error
+	RateRemaining(ctx context.Context) (int, error)
+	SetCurrent(version int) error
+	Cleanup(currentVersion int) error
+}
+
+type multiDownloader struct {
+	downloaderFactory func(httpClient *http.Client) (*github.Downloader, error)
+	httpClient        *http.Client
+	dbStore           *store.DB
+}
+
+func newMultiDownloader(httpClient *http.Client, db *sql.DB) *multiDownloader {
+	dbStore := &store.DB{DB: db}
+	return &multiDownloader{
+		downloaderFactory: func(httpClient *http.Client) (*github.Downloader, error) {
+			return github.NewDownloader(httpClient, db)
+		},
+		httpClient: httpClient,
+		dbStore:    dbStore,
+	}
+}
+
+func (md *multiDownloader) DownloadOrganization(ctx context.Context, name string, version int) error {
+	downloader, err := md.downloaderFactory(md.httpClient)
+	if err != nil {
+		return err
+	}
+
+	err = downloader.DownloadOrganization(ctx, name, version)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (md *multiDownloader) DownloadRepository(ctx context.Context, owner string, name string, version int) error {
+	downloader, err := md.downloaderFactory(md.httpClient)
+	if err != nil {
+		return err
+	}
+
+	err = downloader.DownloadRepository(ctx, owner, name, version)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (md *multiDownloader) RateRemaining(ctx context.Context) (int, error) {
+	downloader, err := md.downloaderFactory(md.httpClient)
+	if err != nil {
+		return 0, err
+	}
+
+	r, err := downloader.RateRemaining(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	return r, nil
+}
+
+func (md *multiDownloader) SetCurrent(version int) error {
+	err := md.dbStore.SetActiveVersion(version)
+	if err != nil {
+		return fmt.Errorf("failed to set current DB version to %v: %v", version, err)
+	}
+	return nil
+}
+
+func (md *multiDownloader) Cleanup(currentVersion int) error {
+	err := md.dbStore.Cleanup(currentVersion)
+	if err != nil {
+		return fmt.Errorf("failed to do cleanup for DB version %v: %v", currentVersion, err)
+	}
+	return nil
+}
+
+func (c *DownloaderCmd) buildDownloader(client *http.Client) (downloader, error) {
 	if c.DB == "" {
 		log.Infof("using stdout to save the data")
 		return github.NewStdoutDownloader(client)
 	}
 
-	db, err := sql.Open("postgres", c.DB)
+	var err error
+	db, err = sql.Open("postgres", c.DB)
 	if err != nil {
 		return nil, err
 	}
@@ -176,5 +314,5 @@ func (c *DownloaderCmd) buildDownloader(client *http.Client) (*github.Downloader
 		return nil, err
 	}
 
-	return github.NewDownloader(client, db)
+	return newMultiDownloader(client, db), nil
 }
