@@ -2,6 +2,7 @@ package github
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -52,6 +53,10 @@ func retry(f func() error) error {
 		err := f()
 		if err == nil {
 			return nil
+		}
+
+		if err == context.Canceled {
+			return err
 		}
 
 		if i == retries {
