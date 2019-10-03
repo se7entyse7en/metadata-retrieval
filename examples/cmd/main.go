@@ -115,37 +115,14 @@ func (c *DownloaderCmd) ExecuteBody(logger log.Logger, fn bodyFunc) error {
 		setLogTransport(client, logger)
 	}
 
-	var downloader *github.Downloader
-	if c.DB == "" {
-		log.Infof("using stdout to save the data")
-		var err error
-		downloader, err = github.NewStdoutDownloader(client)
-		if err != nil {
-			return err
-		}
-	} else {
-		db, err := sql.Open("postgres", c.DB)
-		if err != nil {
-			return err
-		}
-
-		defer func() {
-			if err != nil {
-				db.Close()
-				db = nil
-			}
-		}()
-
-		if err = db.Ping(); err != nil {
-			return err
-		}
-
-		if err = database.Migrate(c.DB); err != nil && err != migrate.ErrNoChange {
-			return err
-		}
-
-		downloader, err = github.NewDownloader(client, db)
+	downloader, err := c.buildDownloader(client)
+	if err != nil {
+		return err
 	}
+
+	defer func() {
+		downloader.Close()
+	}()
 
 	rate0, err := downloader.RateRemaining(context.TODO())
 	if err != nil {
@@ -178,4 +155,26 @@ func (c *DownloaderCmd) ExecuteBody(logger log.Logger, fn bodyFunc) error {
 	logger.With(log.Fields{"rate-limit-used": rateUsed, "total-elapsed": elapsed}).Infof("All metadata fetched")
 
 	return nil
+}
+
+func (c *DownloaderCmd) buildDownloader(client *http.Client) (*github.Downloader, error) {
+	if c.DB == "" {
+		log.Infof("using stdout to save the data")
+		return github.NewStdoutDownloader(client)
+	}
+
+	db, err := sql.Open("postgres", c.DB)
+	if err != nil {
+		return nil, err
+	}
+
+	if err = db.Ping(); err != nil {
+		return nil, err
+	}
+
+	if err = database.Migrate(c.DB); err != nil && err != migrate.ErrNoChange {
+		return nil, err
+	}
+
+	return github.NewDownloader(client, db)
 }
